@@ -43,7 +43,7 @@
 ├── LICENSE                          GPL-3.0
 ├── README.md
 ├── packaging/
-│   └── quickshell-clipboard.spec    RPM spec
+│   └── qt6-qml-clipboard.spec    RPM spec
 ├── protocols/
 │   ├── ext-data-control-v1.xml
 │   └── wlr-data-control-unstable-v1.xml
@@ -171,7 +171,7 @@ Singleton {
 
 ## 打包 RPM
 
-仓库自带 `packaging/quickshell-clipboard.spec`。
+仓库自带 `packaging/qt6-qml-clipboard.spec`。
 
 主要构建依赖：`cmake`、`gcc-c++`、`ninja`、`pkgconfig(wayland-client)`、
 `qt6-base-devel`、`qt6-declarative-devel`。
