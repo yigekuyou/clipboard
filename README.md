@@ -171,19 +171,7 @@ Singleton {
 
 ## 打包 RPM
 
-仓库自带 `packaging/quickshell-clipboard.spec`。先按 spec 预期的名字生成源码包：
-
-```sh
-git archive --prefix=quickshell-clipboard-0.1.0/ \
-    -o quickshell-clipboard-0.1.0.tar.gz HEAD
-rpmbuild -ta quickshell-clipboard-0.1.0.tar.gz
-```
-
-或放进 `~/rpmbuild/SOURCES/` 后：
-
-```sh
-rpmbuild -ba packaging/quickshell-clipboard.spec
-```
+仓库自带 `packaging/quickshell-clipboard.spec`。
 
 主要构建依赖：`cmake`、`gcc-c++`、`ninja`、`pkgconfig(wayland-client)`、
 `qt6-base-devel`、`qt6-declarative-devel`。
