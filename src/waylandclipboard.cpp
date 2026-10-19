@@ -4,6 +4,7 @@
 #include <QDebug>
 #include <QHash>
 #include <QList>
+#include <QSet>
 #include <QSocketNotifier>
 #include <QTimer>
 
@@ -107,6 +108,20 @@ struct WaylandClipboard::Impl
     Offer *selection = nullptr;
     QHash<wl_proxy *, Source *> sources;
 
+    // One in-flight "serve the selection" transfer per receiving client.
+    // The payload (a screenshot easily is a few megabytes) must not be
+    // written in a single blocking call: when the receiving client is
+    // ourselves -- the manager reads back the selection it just installed
+    // to put it into the history -- the read side can only run in the event
+    // loop we are blocking, so both ends wait for each other forever.
+    struct Send {
+        QByteArray data;
+        int fd = -1;
+        qsizetype offset = 0;
+        QSocketNotifier *notifier = nullptr;
+    };
+    QSet<Send *> sends;
+
     // Incoming transfer (selection -> us).
     int transferFd = -1;
     QSocketNotifier *transferNotifier = nullptr;
@@ -157,6 +172,9 @@ struct WaylandClipboard::Impl
     // -- sources (we own the selection) ------------------------------------
     void installSource(const QByteArray &data, const QList<QByteArray> &mimes);
     void handleSourceSend(Source *source, const char *mime, int fd);
+    void onSendWritable(Send *send);
+    void finishSend(Send *send);
+    void cancelSends();
     void handleSourceCancelled(Source *source);
     void destroySource(Source *source);
 };
@@ -372,6 +390,7 @@ bool WaylandClipboard::Impl::connectDisplay()
 void WaylandClipboard::Impl::teardown()
 {
     cancelTransfer();
+    cancelSends();
 
     const QList<Source *> liveSources = sources.values();
     for (Source *source : liveSources)
@@ -943,19 +962,75 @@ void WaylandClipboard::Impl::handleSourceSend(Source *source, const char *mime, 
 {
     Q_UNUSED(mime) // only MIME types we advertised are requested
 
-    qsizetype offset = 0;
-    const QByteArray &data = source->data;
-    while (offset < data.size()) {
-        const ssize_t n = ::write(fd, data.constData() + offset,
-                                  static_cast<size_t>(data.size() - offset));
+    if (!source || fd < 0) {
+        if (fd >= 0)
+            ::close(fd);
+        return;
+    }
+
+    // Only the receiving side may block; this process writes from the event
+    // loop so a large payload never stalls the GUI thread (see Impl::Send).
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags >= 0)
+        ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    auto *send = new Send;
+    // Shared, not copied: the source may be replaced (another client takes the
+    // selection) while the transfer is still in flight.
+    send->data = source->data;
+    send->fd = fd;
+    send->notifier = new QSocketNotifier(fd, QSocketNotifier::Write, q);
+    QObject::connect(send->notifier, &QSocketNotifier::activated, q,
+                     [this, send](QSocketDescriptor, QSocketNotifier::Type) { onSendWritable(send); });
+    sends.insert(send);
+
+    // Text fits into the pipe buffer, so this already finishes most transfers
+    // without ever enabling the notifier.
+    onSendWritable(send);
+}
+
+void WaylandClipboard::Impl::onSendWritable(Send *send)
+{
+    if (!send)
+        return;
+
+    while (send->offset < send->data.size()) {
+        const ssize_t n = ::write(send->fd, send->data.constData() + send->offset,
+                                  static_cast<size_t>(send->data.size() - send->offset));
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            break; // EPIPE: the pasting client went away
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return; // pipe full: the notifier resumes when the reader drains
+            finishSend(send); // EPIPE: the pasting client went away
+            return;
         }
-        offset += n;
+        send->offset += n;
     }
-    ::close(fd);
+    finishSend(send);
+}
+
+void WaylandClipboard::Impl::finishSend(Send *send)
+{
+    if (!send)
+        return;
+    sends.remove(send);
+    if (send->notifier) {
+        send->notifier->setEnabled(false);
+        QObject::disconnect(send->notifier, nullptr, q, nullptr);
+        send->notifier->deleteLater();
+    }
+    if (send->fd >= 0)
+        ::close(send->fd);
+    delete send;
+}
+
+void WaylandClipboard::Impl::cancelSends()
+{
+    const QList<Send *> live(sends.begin(), sends.end());
+    for (Send *send : live)
+        finishSend(send);
+    sends.clear();
 }
 
 void WaylandClipboard::Impl::handleSourceCancelled(Source *source)
@@ -1004,6 +1079,13 @@ WaylandClipboard::~WaylandClipboard() = default;
 bool WaylandClipboard::start()
 {
     return d->connectDisplay();
+}
+
+bool WaylandClipboard::asyncSend() const
+{
+    // Serving the selection never runs a blocking write any more, so a
+    // multi-megabyte payload (screenshot) cannot stall the event loop.
+    return true;
 }
 
 bool WaylandClipboard::isAvailable() const

@@ -399,6 +399,11 @@ void ClipboardManager::setCurrent(const QString &kind, const QString &text)
     emit currentChanged();
 }
 
+bool ClipboardManager::asyncSend() const
+{
+    return m_wayland->asyncSend();
+}
+
 void ClipboardManager::copyToClipboard(const QString &text)
 {
     if (text.isEmpty())

@@ -35,6 +35,10 @@ public:
     bool start();
 
     bool isAvailable() const;
+
+    /// True when serving the selection is asynchronous, i.e. large payloads
+    /// (images) can be published without blocking the event loop.
+    bool asyncSend() const;
     /// "ext-data-control-v1", "wlr-data-control-unstable-v1" or empty.
     QString backendName() const;
 

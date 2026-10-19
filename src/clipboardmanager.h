@@ -103,6 +103,10 @@ class ClipboardManager : public QObject, public QQmlParserStatus
     Q_PROPERTY(QString currentText READ currentText NOTIFY currentChanged)
     Q_PROPERTY(QString currentKind READ currentKind NOTIFY currentChanged)
     Q_PROPERTY(int maxHistory READ maxHistory WRITE setMaxHistory NOTIFY maxHistoryChanged)
+    /// True when large images can be published without blocking the shell.
+    /// Older builds served the selection with a blocking write, which froze
+    /// the event loop for payloads bigger than the pipe buffer (screenshots).
+    Q_PROPERTY(bool asyncSend READ asyncSend CONSTANT)
 
 public:
     explicit ClipboardManager(QObject *parent = nullptr);
@@ -119,6 +123,8 @@ public:
     QString currentKind() const { return m_currentKind; }
     int maxHistory() const { return m_maxHistory; }
     void setMaxHistory(int maxHistory);
+
+    bool asyncSend() const;
 
     Q_INVOKABLE void copyToClipboard(const QString &text);
     Q_INVOKABLE void copyImage(const QString &path, const QString &mime = QString());
