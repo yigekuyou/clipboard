@@ -1,5 +1,5 @@
 #
-# spec file for package quickshell-clipboard
+# spec file for package qt6-qml-clipboard
 #
 # Copyright (c) 2026 yigekuyou
 #
@@ -8,14 +8,14 @@
 # upon.
 #
 
-Name:           quickshell-clipboard
+Name:           qt6-qml-clipboard
 Version:        0.1.0
 Release:        0
 Summary:        Wayland data-control clipboard manager as a Qt 6 QML module
 License:        GPL-3.0-or-later
 Group:          System/GUI/Other
 URL:            https://github.com/yigekuyou/clipboard
-Source0:        %{name}-%{version}.tar.gz
+Source:         _service
 BuildRequires:  cmake
 BuildRequires:  gcc-c++
 BuildRequires:  ninja
@@ -36,7 +36,10 @@ when the process exits, the data-control connection is closed and the
 selection is released.
 
 %prep
-%autosetup
+%setup -q -n %_sourcedir/%name-%version -T -D
+%__mkdir -p %_builddir/%_sourcedir
+
+%__ln -s %_sourcedir/%name-%version %_builddir/%_sourcedir
 
 %build
 %cmake_qt6
@@ -53,5 +56,3 @@ selection is released.
 %{_qt6_qmldir}/io/yigekuyou/clipboard/
 
 %changelog
-* Mon Oct 19 2026 yigekuyou <yigekuyou@users.noreply.github.com> - 0.1.0-0
-- Initial package
