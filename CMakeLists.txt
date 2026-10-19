@@ -56,18 +56,24 @@ add_custom_target(clipboard_protocols DEPENDS ${PROTOCOL_HEADERS} ${PROTOCOL_SOU
 # QML module
 # ---------------------------------------------------------------------------
 
+# QML module URI. The install layout mirrors it as a path, so changing the
+# URI here also moves the module directory.
+set(CLIPBOARD_URI "com.github.yigekuyou.clipboard")
+string(REPLACE "." "/" CLIPBOARD_URI_PATH "${CLIPBOARD_URI}")
+
 # Same layout as the Qt 6 packages of the distributions: <libdir>/qt6/qml.
 # Override the cache entry for a different layout.
-set(CLIPBOARD_QML_DIR "${CMAKE_INSTALL_LIBDIR}/qt6/qml/io/yigekuyou/clipboard"
+set(CLIPBOARD_QML_DIR "${CMAKE_INSTALL_LIBDIR}/qt6/qml/${CLIPBOARD_URI_PATH}"
     CACHE STRING "Install directory for the QML module (relative to the prefix or absolute)")
+set(CLIPBOARD_BUILD_DIR "${CMAKE_BINARY_DIR}/${CLIPBOARD_URI_PATH}")
 
 qt_add_library(clipboard SHARED)
 add_dependencies(clipboard clipboard_protocols)
 
 qt_add_qml_module(clipboard
-    URI io.yigekuyou.clipboard
+    URI ${CLIPBOARD_URI}
     VERSION 1.0
-    OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/io/yigekuyou/clipboard
+    OUTPUT_DIRECTORY ${CLIPBOARD_BUILD_DIR}
     SOURCES
         src/clipboardmanager.cpp src/clipboardmanager.h
         src/waylandclipboard.cpp src/waylandclipboard.h
@@ -86,6 +92,6 @@ install(TARGETS clipboard clipboardplugin
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CLIPBOARD_QML_DIR})
 
-install(FILES ${CMAKE_BINARY_DIR}/io/yigekuyou/clipboard/qmldir
-              ${CMAKE_BINARY_DIR}/io/yigekuyou/clipboard/clipboard.qmltypes
+install(FILES ${CLIPBOARD_BUILD_DIR}/qmldir
+              ${CLIPBOARD_BUILD_DIR}/clipboard.qmltypes
         DESTINATION ${CLIPBOARD_QML_DIR})

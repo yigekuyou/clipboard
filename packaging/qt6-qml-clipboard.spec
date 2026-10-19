@@ -22,10 +22,10 @@ BuildRequires:  ninja
 BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  qt6-base-devel
 BuildRequires:  qt6-declarative-devel
-Provides:       qml(io.yigekuyou.clipboard)
+Provides:       qml(com.github.yigekuyou.clipboard)
 
 %description
-A Qt 6 QML module (io.yigekuyou.clipboard) that implements a Wayland
+A Qt 6 QML module (com.github.yigekuyou.clipboard) that implements a Wayland
 clipboard manager on top of ext-data-control-v1 and
 wlr-data-control-unstable-v1.  It observes and replaces the selection
 without requiring keyboard focus, keeps a de-duplicated history (text and
@@ -51,8 +51,8 @@ selection is released.
 %files
 %license LICENSE
 %doc README.md
-%dir %{_qt6_qmldir}/io
-%dir %{_qt6_qmldir}/io/yigekuyou
-%{_qt6_qmldir}/io/yigekuyou/clipboard/
+%dir %{_qt6_qmldir}/com
+%dir %{_qt6_qmldir}/com/github/yigekuyou
+%{_qt6_qmldir}/com/github/yigekuyou/clipboard/
 
 %changelog

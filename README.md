@@ -1,10 +1,10 @@
 # quickshell-clipboard
 
-一个 Qt 6 QML 模块（`io.yigekuyou.clipboard`），在 Wayland 下实现剪贴板管理器：
+一个 Qt 6 QML 模块（`com.github.yigekuyou.clipboard`），在 Wayland 下实现剪贴板管理器：
 无焦点也能读取和替换 selection，并把文本/图片历史以**纯内存**方式提供给 QML。
 
 它最初为 [Quickshell](https://quickshell.org/) 编写，但模块本身不依赖 Quickshell，
-任何 Qt Quick 应用都可以 `import io.yigekuyou.clipboard` 使用。
+任何 Qt Quick 应用都可以 `import com.github.yigekuyou.clipboard` 使用。
 
 许可证：**GPL-3.0-or-later**（与 Qt 的开源授权要求兼容）。
 
@@ -107,17 +107,17 @@ cmake --build build
 sudo cmake --install build --prefix /usr
 ```
 
-默认安装到 `$prefix/lib64/qt6/qml/io/yigekuyou/clipboard/`（与发行版 Qt 6 的
+默认安装到 `$prefix/lib64/qt6/qml/com/github/yigekuyou/clipboard/`（与发行版 Qt 6 的
 QML 目录一致），也可以覆盖：
 
 ```sh
-cmake -S . -B build -DCLIPBOARD_QML_DIR=lib/qml/io/yigekuyou/clipboard
+cmake -S . -B build -DCLIPBOARD_QML_DIR=lib/qml/com/github/yigekuyou/clipboard
 ```
 
 安装后即可直接：
 
 ```qml
-import io.yigekuyou.clipboard
+import com.github.yigekuyou.clipboard
 
 Item {
     Repeater {
@@ -134,7 +134,7 @@ Quickshell 0.3.x 只把 `qs:@/` 加进 import 路径，没有提供注入系统 
 用相对目录导入：
 
 ```sh
-ln -sfn /usr/lib64/qt6/qml/io/yigekuyou/clipboard \
+ln -sfn /usr/lib64/qt6/qml/com/github/yigekuyou/clipboard \
         ~/.config/quickshell/ClipboardModule
 ```
 
@@ -167,7 +167,7 @@ Singleton {
 ```
 
 或者启动 Quickshell 时设置 `QML_IMPORT_PATH=/usr/lib64/qt6/qml`，然后直接
-`import io.yigekuyou.clipboard`。
+`import com.github.yigekuyou.clipboard`。
 
 ## 打包 RPM
 
