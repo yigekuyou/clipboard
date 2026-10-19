@@ -43,7 +43,7 @@
 ├── LICENSE                          GPL-3.0
 ├── README.md
 ├── packaging/
-│   └── qt6-qml-clipboard.spec    RPM spec
+│   └── qt6-qml-clipboard.spec       RPM spec
 ├── protocols/
 │   ├── ext-data-control-v1.xml
 │   └── wlr-data-control-unstable-v1.xml
