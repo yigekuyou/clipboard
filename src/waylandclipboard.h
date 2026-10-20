@@ -20,8 +20,19 @@
  *
  * The class opens its own wl_display connection, so it works from any Qt
  * application and does not depend on QtWaylandClient or on the connection
- * QGuiApplication uses.  All events are integrated into the Qt event loop
- * through QSocketNotifier; no thread or child process is involved.
+ * QGuiApplication uses.  No helper program and no disk access is involved.
+ *
+ * The connection is dispatched from a dedicated worker thread rather than the
+ * GUI thread.  A selection owner has to answer data_source.send() while the
+ * pasting client is blocked reading the pipe; when that client is the host
+ * application itself -- Quickshell reading its own QClipboard -- the main
+ * thread is inside QtWayland's one-second poll() and could never dispatch the
+ * connection, so the read would fail with
+ * "QWaylandDataOffer: timeout reading from pipe" and an empty clipboard.
+ *
+ * Consequently the public setters are asynchronous (the request is queued to
+ * the worker) and the received/failed/started signals are delivered on the
+ * thread that owns the object.
  */
 class WaylandClipboard : public QObject
 {
@@ -31,7 +42,9 @@ public:
     explicit WaylandClipboard(QObject *parent = nullptr);
     ~WaylandClipboard() override;
 
-    /// Connect to the compositor.  Safe to call repeatedly.
+    /// Connect to the compositor and return whether a backend could be bound.
+    /// Blocks until the worker finished its registry round trips (a few
+    /// milliseconds).  Safe to call repeatedly.
     bool start();
 
     bool isAvailable() const;
@@ -48,7 +61,8 @@ public:
     /// Take ownership of the selection and serve @p data as @p mime.
     void setImage(const QByteArray &data, const QString &mime);
 
-    // Public only so the C protocol listener shims in the .cpp can name it.
+    // State shared between this object and the worker thread; public only so
+    // the worker implementation in the .cpp can name it.
     struct Impl;
 
 signals:

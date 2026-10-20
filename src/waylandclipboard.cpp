@@ -4,12 +4,16 @@
 #include <QDebug>
 #include <QHash>
 #include <QList>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QSet>
 #include <QSocketNotifier>
+#include <QThread>
 #include <QTimer>
 
 #include <wayland-client.h>
 
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -61,29 +65,91 @@ QString socketError()
 } // namespace
 
 // ============================================================================
-// Impl
+// Facade state (main thread)
 // ============================================================================
 
+class ClipboardWorker;
+
+/**
+ * State shared between the public object (main thread) and the worker.
+ * Only these two values are exchanged across threads, so plain atomics and a
+ * mutex are enough -- everything else lives on the worker thread.
+ */
 struct WaylandClipboard::Impl
 {
-    explicit Impl(WaylandClipboard *owner) : q(owner) { }
-    ~Impl() { teardown(); }
+    explicit Impl(WaylandClipboard *owner);
+    ~Impl();
+
+    void publish(bool isAvailable, const QString &backendName);
+    QString backendName() const;
+
+    WaylandClipboard *q = nullptr;
+    QThread thread;
+    ClipboardWorker *worker = nullptr;
+
+    std::atomic_bool available{ false };
+    mutable QMutex backendMutex;
+    QString backend;
+};
+
+// ============================================================================
+// ClipboardWorker (worker thread)
+// ============================================================================
+
+/**
+ * Owns the Wayland connection and all of its objects, and dispatches its
+ * events from a dedicated thread.
+ *
+ * Why a thread: whoever owns the selection has to answer
+ * data_source.send() while the *receiving* client is blocked reading the
+ * pipe.  When that receiver is the host application itself -- Quickshell
+ * reading its own QClipboard -- the main thread sits inside QtWayland's
+ * one-second poll() and can never dispatch our connection, so the read dies
+ * with "QWaylandDataOffer: timeout reading from pipe" and an empty
+ * clipboard.  Serving from a worker thread means the reader is never also
+ * the dispatcher, no matter where the read comes from.
+ */
+class ClipboardWorker : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit ClipboardWorker(WaylandClipboard::Impl *facade);
+    ~ClipboardWorker() override;
 
     struct Source {
-        Impl *impl = nullptr;
+        ClipboardWorker *owner = nullptr;
         wl_proxy *proxy = nullptr;
         bool ext = false;
         QByteArray data;
     };
 
     struct Offer {
-        Impl *impl = nullptr;
+        ClipboardWorker *owner = nullptr;
         wl_proxy *proxy = nullptr;
         bool ext = false;
         QList<QByteArray> mimes;
     };
 
-    WaylandClipboard *q = nullptr;
+    // Commands from the facade.  All of them run on the worker thread.
+    bool start();
+    void setText(const QString &text);
+    void setImage(const QByteArray &data, const QString &mime);
+    void shutdown();
+
+signals:
+    void textReceived(const QString &text);
+    void imageReceived(const QByteArray &data, const QString &mime);
+    void selectionUnset();
+    void started(const QString &backend);
+    void failed(const QString &reason);
+
+    // The C protocol listener shims below are free functions, so everything
+    // they call has to be public.  The class is file-local anyway.
+public:
+    void publishState();
+
+    WaylandClipboard::Impl *state = nullptr;
 
     wl_display *display = nullptr;
     wl_registry *registry = nullptr;
@@ -110,10 +176,9 @@ struct WaylandClipboard::Impl
 
     // One in-flight "serve the selection" transfer per receiving client.
     // The payload (a screenshot easily is a few megabytes) must not be
-    // written in a single blocking call: when the receiving client is
-    // ourselves -- the manager reads back the selection it just installed
-    // to put it into the history -- the read side can only run in the event
-    // loop we are blocking, so both ends wait for each other forever.
+    // written in a single blocking call: the worker thread also has to keep
+    // dispatching events (incoming transfers, further requests) while a slow
+    // reader drains the pipe.
     struct Send {
         QByteArray data;
         int fd = -1;
@@ -185,13 +250,13 @@ static void registryGlobal(void *data, wl_registry *registry, uint32_t name,
                            const char *interface, uint32_t version)
 {
     Q_UNUSED(registry)
-    static_cast<WaylandClipboard::Impl *>(data)->handleGlobal(name, interface, version);
+    static_cast<ClipboardWorker *>(data)->handleGlobal(name, interface, version);
 }
 
 static void registryGlobalRemove(void *data, wl_registry *registry, uint32_t name)
 {
     Q_UNUSED(registry)
-    static_cast<WaylandClipboard::Impl *>(data)->handleGlobalRemove(name);
+    static_cast<ClipboardWorker *>(data)->handleGlobalRemove(name);
 }
 
 static const struct wl_registry_listener s_registryListener = {
@@ -203,24 +268,24 @@ static const struct wl_registry_listener s_registryListener = {
 
 static void extDeviceDataOffer(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handleDataOffer(reinterpret_cast<wl_proxy *>(id));
 }
 
 static void extDeviceSelection(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handleSelection(reinterpret_cast<wl_proxy *>(id));
 }
 
 static void extDeviceFinished(void *data, ext_data_control_device_v1 *)
 {
-    static_cast<WaylandClipboard::Impl *>(data)->handleDeviceFinished();
+    static_cast<ClipboardWorker *>(data)->handleDeviceFinished();
 }
 
 static void extDevicePrimarySelection(void *data, ext_data_control_device_v1 *, ext_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handlePrimarySelection(reinterpret_cast<wl_proxy *>(id));
 }
 
@@ -235,24 +300,24 @@ static const struct ext_data_control_device_v1_listener s_extDeviceListener = {
 
 static void wlrDeviceDataOffer(void *data, zwlr_data_control_device_v1 *, zwlr_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handleDataOffer(reinterpret_cast<wl_proxy *>(id));
 }
 
 static void wlrDeviceSelection(void *data, zwlr_data_control_device_v1 *, zwlr_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handleSelection(reinterpret_cast<wl_proxy *>(id));
 }
 
 static void wlrDeviceFinished(void *data, zwlr_data_control_device_v1 *)
 {
-    static_cast<WaylandClipboard::Impl *>(data)->handleDeviceFinished();
+    static_cast<ClipboardWorker *>(data)->handleDeviceFinished();
 }
 
 static void wlrDevicePrimarySelection(void *data, zwlr_data_control_device_v1 *, zwlr_data_control_offer_v1 *id)
 {
-    static_cast<WaylandClipboard::Impl *>(data)
+    static_cast<ClipboardWorker *>(data)
         ->handlePrimarySelection(reinterpret_cast<wl_proxy *>(id));
 }
 
@@ -267,8 +332,8 @@ static const struct zwlr_data_control_device_v1_listener s_wlrDeviceListener = {
 
 static void extOfferOffer(void *data, ext_data_control_offer_v1 *, const char *mime)
 {
-    static_cast<WaylandClipboard::Impl::Offer *>(data)->impl->addMime(
-        static_cast<WaylandClipboard::Impl::Offer *>(data), mime);
+    static_cast<ClipboardWorker::Offer *>(data)->owner->addMime(
+        static_cast<ClipboardWorker::Offer *>(data), mime);
 }
 
 static const struct ext_data_control_offer_v1_listener s_extOfferListener = {
@@ -279,8 +344,8 @@ static const struct ext_data_control_offer_v1_listener s_extOfferListener = {
 
 static void wlrOfferOffer(void *data, zwlr_data_control_offer_v1 *, const char *mime)
 {
-    static_cast<WaylandClipboard::Impl::Offer *>(data)->impl->addMime(
-        static_cast<WaylandClipboard::Impl::Offer *>(data), mime);
+    static_cast<ClipboardWorker::Offer *>(data)->owner->addMime(
+        static_cast<ClipboardWorker::Offer *>(data), mime);
 }
 
 static const struct zwlr_data_control_offer_v1_listener s_wlrOfferListener = {
@@ -291,14 +356,14 @@ static const struct zwlr_data_control_offer_v1_listener s_wlrOfferListener = {
 
 static void extSourceSend(void *data, ext_data_control_source_v1 *, const char *mime, int32_t fd)
 {
-    auto *source = static_cast<WaylandClipboard::Impl::Source *>(data);
-    source->impl->handleSourceSend(source, mime, fd);
+    auto *source = static_cast<ClipboardWorker::Source *>(data);
+    source->owner->handleSourceSend(source, mime, fd);
 }
 
 static void extSourceCancelled(void *data, ext_data_control_source_v1 *)
 {
-    auto *source = static_cast<WaylandClipboard::Impl::Source *>(data);
-    source->impl->handleSourceCancelled(source);
+    auto *source = static_cast<ClipboardWorker::Source *>(data);
+    source->owner->handleSourceCancelled(source);
 }
 
 static const struct ext_data_control_source_v1_listener s_extSourceListener = {
@@ -310,14 +375,14 @@ static const struct ext_data_control_source_v1_listener s_extSourceListener = {
 
 static void wlrSourceSend(void *data, zwlr_data_control_source_v1 *, const char *mime, int32_t fd)
 {
-    auto *source = static_cast<WaylandClipboard::Impl::Source *>(data);
-    source->impl->handleSourceSend(source, mime, fd);
+    auto *source = static_cast<ClipboardWorker::Source *>(data);
+    source->owner->handleSourceSend(source, mime, fd);
 }
 
 static void wlrSourceCancelled(void *data, zwlr_data_control_source_v1 *)
 {
-    auto *source = static_cast<WaylandClipboard::Impl::Source *>(data);
-    source->impl->handleSourceCancelled(source);
+    auto *source = static_cast<ClipboardWorker::Source *>(data);
+    source->owner->handleSourceCancelled(source);
 }
 
 static const struct zwlr_data_control_source_v1_listener s_wlrSourceListener = {
@@ -329,7 +394,7 @@ static const struct zwlr_data_control_source_v1_listener s_wlrSourceListener = {
 // Impl: connection
 // ============================================================================
 
-bool WaylandClipboard::Impl::connectDisplay()
+bool ClipboardWorker::connectDisplay()
 {
     if (display)
         return true;
@@ -338,7 +403,7 @@ bool WaylandClipboard::Impl::connectDisplay()
     if (!display) {
         const QString reason = QStringLiteral("cannot connect to the Wayland display: %1")
                                    .arg(socketError());
-        emit q->failed(reason);
+        emit failed(reason);
         scheduleRetry();
         return false;
     }
@@ -367,7 +432,7 @@ bool WaylandClipboard::Impl::connectDisplay()
             "wlr-data-control-unstable-v1");
         if (!warnedNoProtocol) {
             warnedNoProtocol = true;
-            emit q->failed(reason);
+            emit failed(reason);
         }
         teardown();
         scheduleRetry(30000);
@@ -382,12 +447,13 @@ bool WaylandClipboard::Impl::connectDisplay()
     }
 
     installNotifiers();
+    publishState();
     qInfo() << "[WaylandClipboard] connected using" << backend;
-    emit q->started();
+    emit started(backend);
     return true;
 }
 
-void WaylandClipboard::Impl::teardown()
+void ClipboardWorker::teardown()
 {
     cancelTransfer();
     cancelSends();
@@ -419,13 +485,13 @@ void WaylandClipboard::Impl::teardown()
 
     if (readNotifier) {
         readNotifier->setEnabled(false);
-        QObject::disconnect(readNotifier, nullptr, q, nullptr);
+        QObject::disconnect(readNotifier, nullptr, this, nullptr);
         readNotifier->deleteLater();
         readNotifier = nullptr;
     }
     if (writeNotifier) {
         writeNotifier->setEnabled(false);
-        QObject::disconnect(writeNotifier, nullptr, q, nullptr);
+        QObject::disconnect(writeNotifier, nullptr, this, nullptr);
         writeNotifier->deleteLater();
         writeNotifier = nullptr;
     }
@@ -447,26 +513,27 @@ void WaylandClipboard::Impl::teardown()
     ext = false;
     backend.clear();
     extName = wlrName = seatName = 0;
+    publishState();
 }
 
-void WaylandClipboard::Impl::scheduleRetry(int delayMs)
+void ClipboardWorker::scheduleRetry(int delayMs)
 {
     if (retryScheduled)
         return;
     retryScheduled = true;
-    QTimer::singleShot(delayMs, q, [this] {
+    QTimer::singleShot(delayMs, this, [this] {
         retryScheduled = false;
         if (!display)
-            q->start();
+            connectDisplay();
     });
 }
 
-void WaylandClipboard::Impl::handleDisconnect(const QString &reason)
+void ClipboardWorker::handleDisconnect(const QString &reason)
 {
     const bool wasConnected = display != nullptr;
     teardown();
     if (wasConnected)
-        emit q->failed(reason);
+        emit failed(reason);
     scheduleRetry();
 }
 
@@ -474,7 +541,7 @@ void WaylandClipboard::Impl::handleDisconnect(const QString &reason)
 // Impl: registry
 // ============================================================================
 
-void WaylandClipboard::Impl::handleGlobal(uint32_t name, const char *interface, uint32_t version)
+void ClipboardWorker::handleGlobal(uint32_t name, const char *interface, uint32_t version)
 {
     const QByteArray iface(interface);
 
@@ -495,7 +562,7 @@ void WaylandClipboard::Impl::handleGlobal(uint32_t name, const char *interface, 
         ensureObjects();
 }
 
-void WaylandClipboard::Impl::handleGlobalRemove(uint32_t name)
+void ClipboardWorker::handleGlobalRemove(uint32_t name)
 {
     if (name != seatName)
         return;
@@ -516,7 +583,7 @@ void WaylandClipboard::Impl::handleGlobalRemove(uint32_t name)
     }
 }
 
-void WaylandClipboard::Impl::ensureObjects()
+void ClipboardWorker::ensureObjects()
 {
     if (!display || !registry)
         return;
@@ -565,32 +632,36 @@ void WaylandClipboard::Impl::ensureObjects()
                     &s_wlrDeviceListener, this);
         }
     }
+
+    // A seat or manager may show up after the initial round trip; keep
+    // isAvailable() honest in that case.
+    publishState();
 }
 
 // ============================================================================
 // Impl: dispatch
 // ============================================================================
 
-void WaylandClipboard::Impl::installNotifiers()
+void ClipboardWorker::installNotifiers()
 {
     if (readNotifier || !display)
         return;
 
     readNotifier = new QSocketNotifier(wl_display_get_fd(display),
-                                       QSocketNotifier::Read, q);
-    QObject::connect(readNotifier, &QSocketNotifier::activated, q,
+                                       QSocketNotifier::Read, this);
+    QObject::connect(readNotifier, &QSocketNotifier::activated, this,
                      [this](QSocketDescriptor, QSocketNotifier::Type) { onReadable(); });
 
     writeNotifier = new QSocketNotifier(wl_display_get_fd(display),
-                                        QSocketNotifier::Write, q);
+                                        QSocketNotifier::Write, this);
     writeNotifier->setEnabled(false);
-    QObject::connect(writeNotifier, &QSocketNotifier::activated, q,
+    QObject::connect(writeNotifier, &QSocketNotifier::activated, this,
                      [this](QSocketDescriptor, QSocketNotifier::Type) { onWritable(); });
 
     flush();
 }
 
-void WaylandClipboard::Impl::flush()
+void ClipboardWorker::flush()
 {
     if (!display)
         return;
@@ -606,7 +677,7 @@ void WaylandClipboard::Impl::flush()
     }
 }
 
-void WaylandClipboard::Impl::onWritable()
+void ClipboardWorker::onWritable()
 {
     if (!display)
         return;
@@ -618,7 +689,7 @@ void WaylandClipboard::Impl::onWritable()
     }
 }
 
-void WaylandClipboard::Impl::onReadable()
+void ClipboardWorker::onReadable()
 {
     if (!display)
         return;
@@ -662,7 +733,7 @@ void WaylandClipboard::Impl::onReadable()
 // Impl: device events
 // ============================================================================
 
-void WaylandClipboard::Impl::handleDataOffer(wl_proxy *proxy)
+void ClipboardWorker::handleDataOffer(wl_proxy *proxy)
 {
     if (!proxy)
         return;
@@ -672,7 +743,7 @@ void WaylandClipboard::Impl::handleDataOffer(wl_proxy *proxy)
     destroyOffer(pendingOffer);
 
     auto *offer = new Offer;
-    offer->impl = this;
+    offer->owner = this;
     offer->proxy = proxy;
     offer->ext = ext;
     pendingOffer = offer;
@@ -686,7 +757,7 @@ void WaylandClipboard::Impl::handleDataOffer(wl_proxy *proxy)
     }
 }
 
-WaylandClipboard::Impl::Offer *WaylandClipboard::Impl::takePendingOffer(wl_proxy *proxy)
+ClipboardWorker::Offer *ClipboardWorker::takePendingOffer(wl_proxy *proxy)
 {
     if (pendingOffer && pendingOffer->proxy == proxy) {
         Offer *offer = pendingOffer;
@@ -696,7 +767,7 @@ WaylandClipboard::Impl::Offer *WaylandClipboard::Impl::takePendingOffer(wl_proxy
     return nullptr;
 }
 
-void WaylandClipboard::Impl::handleSelection(wl_proxy *proxy)
+void ClipboardWorker::handleSelection(wl_proxy *proxy)
 {
     // Whatever was being received belongs to the old selection.
     cancelTransfer();
@@ -709,7 +780,7 @@ void WaylandClipboard::Impl::handleSelection(wl_proxy *proxy)
         // happen, but do not leak it).
         destroyOffer(pendingOffer);
         pendingOffer = nullptr;
-        emit q->selectionUnset();
+        emit selectionUnset();
         return;
     }
 
@@ -724,7 +795,7 @@ void WaylandClipboard::Impl::handleSelection(wl_proxy *proxy)
     chooseOffer(offer);
 }
 
-void WaylandClipboard::Impl::handlePrimarySelection(wl_proxy *proxy)
+void ClipboardWorker::handlePrimarySelection(wl_proxy *proxy)
 {
     // Primary selection is not mirrored into the history, but its offer must
     // be destroyed to avoid leaking proxies.
@@ -733,7 +804,7 @@ void WaylandClipboard::Impl::handlePrimarySelection(wl_proxy *proxy)
         destroyOffer(offer);
 }
 
-void WaylandClipboard::Impl::handleDeviceFinished()
+void ClipboardWorker::handleDeviceFinished()
 {
     handleDisconnect(QStringLiteral("the compositor invalidated the data device"));
 }
@@ -742,7 +813,7 @@ void WaylandClipboard::Impl::handleDeviceFinished()
 // Impl: offers / incoming data
 // ============================================================================
 
-void WaylandClipboard::Impl::addMime(Offer *offer, const char *mime)
+void ClipboardWorker::addMime(Offer *offer, const char *mime)
 {
     if (!offer || !mime)
         return;
@@ -751,7 +822,7 @@ void WaylandClipboard::Impl::addMime(Offer *offer, const char *mime)
         offer->mimes.append(value);
 }
 
-void WaylandClipboard::Impl::chooseOffer(Offer *offer)
+void ClipboardWorker::chooseOffer(Offer *offer)
 {
     QByteArray mime;
     int kind = 0;
@@ -782,7 +853,7 @@ void WaylandClipboard::Impl::chooseOffer(Offer *offer)
     requestData(offer, mime, kind);
 }
 
-void WaylandClipboard::Impl::requestData(Offer *offer, const QByteArray &mime, int kind)
+void ClipboardWorker::requestData(Offer *offer, const QByteArray &mime, int kind)
 {
     int fds[2] = { -1, -1 };
     if (::pipe2(fds, O_CLOEXEC) != 0) {
@@ -818,12 +889,12 @@ void WaylandClipboard::Impl::requestData(Offer *offer, const QByteArray &mime, i
     transferMime = mime;
     transferKind = kind;
 
-    transferNotifier = new QSocketNotifier(transferFd, QSocketNotifier::Read, q);
-    QObject::connect(transferNotifier, &QSocketNotifier::activated, q,
+    transferNotifier = new QSocketNotifier(transferFd, QSocketNotifier::Read, this);
+    QObject::connect(transferNotifier, &QSocketNotifier::activated, this,
                      [this](QSocketDescriptor, QSocketNotifier::Type) { onTransferReadable(); });
 }
 
-void WaylandClipboard::Impl::onTransferReadable()
+void ClipboardWorker::onTransferReadable()
 {
     char buffer[65536];
     for (;;) {
@@ -852,7 +923,7 @@ void WaylandClipboard::Impl::onTransferReadable()
     }
 }
 
-void WaylandClipboard::Impl::finishTransfer()
+void ClipboardWorker::finishTransfer()
 {
     const QByteArray data = transferData;
     const QByteArray mime = transferMime;
@@ -868,17 +939,17 @@ void WaylandClipboard::Impl::finishTransfer()
             text = QString::fromLatin1(data); // legacy X11 encodings
         else
             text = QString::fromUtf8(data);
-        emit q->textReceived(text);
+        emit textReceived(text);
     } else if (kind == 2) {
-        emit q->imageReceived(data, QString::fromLatin1(mime));
+        emit imageReceived(data, QString::fromLatin1(mime));
     }
 }
 
-void WaylandClipboard::Impl::cancelTransfer()
+void ClipboardWorker::cancelTransfer()
 {
     if (transferNotifier) {
         transferNotifier->setEnabled(false);
-        QObject::disconnect(transferNotifier, nullptr, q, nullptr);
+        QObject::disconnect(transferNotifier, nullptr, this, nullptr);
         transferNotifier->deleteLater();
         transferNotifier = nullptr;
     }
@@ -891,7 +962,7 @@ void WaylandClipboard::Impl::cancelTransfer()
     transferKind = 0;
 }
 
-void WaylandClipboard::Impl::destroyOffer(Offer *offer)
+void ClipboardWorker::destroyOffer(Offer *offer)
 {
     if (!offer)
         return;
@@ -910,14 +981,14 @@ void WaylandClipboard::Impl::destroyOffer(Offer *offer)
 // Impl: sources / outgoing data
 // ============================================================================
 
-void WaylandClipboard::Impl::installSource(const QByteArray &data,
-                                           const QList<QByteArray> &mimes)
+void ClipboardWorker::installSource(const QByteArray &data,
+                                    const QList<QByteArray> &mimes)
 {
     if (!manager || !device || mimes.isEmpty())
         return;
 
     auto *source = new Source;
-    source->impl = this;
+    source->owner = this;
     source->ext = ext;
     source->data = data;
 
@@ -958,7 +1029,7 @@ void WaylandClipboard::Impl::installSource(const QByteArray &data,
     flush();
 }
 
-void WaylandClipboard::Impl::handleSourceSend(Source *source, const char *mime, int fd)
+void ClipboardWorker::handleSourceSend(Source *source, const char *mime, int fd)
 {
     Q_UNUSED(mime) // only MIME types we advertised are requested
 
@@ -968,8 +1039,9 @@ void WaylandClipboard::Impl::handleSourceSend(Source *source, const char *mime, 
         return;
     }
 
-    // Only the receiving side may block; this process writes from the event
-    // loop so a large payload never stalls the GUI thread (see Impl::Send).
+    // Only the receiving side may block; we write from the worker thread's
+    // event loop so a large payload never stalls the dispatch of further
+    // events either (see Send).
     const int flags = ::fcntl(fd, F_GETFL);
     if (flags >= 0)
         ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -979,8 +1051,8 @@ void WaylandClipboard::Impl::handleSourceSend(Source *source, const char *mime, 
     // selection) while the transfer is still in flight.
     send->data = source->data;
     send->fd = fd;
-    send->notifier = new QSocketNotifier(fd, QSocketNotifier::Write, q);
-    QObject::connect(send->notifier, &QSocketNotifier::activated, q,
+    send->notifier = new QSocketNotifier(fd, QSocketNotifier::Write, this);
+    QObject::connect(send->notifier, &QSocketNotifier::activated, this,
                      [this, send](QSocketDescriptor, QSocketNotifier::Type) { onSendWritable(send); });
     sends.insert(send);
 
@@ -989,7 +1061,7 @@ void WaylandClipboard::Impl::handleSourceSend(Source *source, const char *mime, 
     onSendWritable(send);
 }
 
-void WaylandClipboard::Impl::onSendWritable(Send *send)
+void ClipboardWorker::onSendWritable(Send *send)
 {
     if (!send)
         return;
@@ -1010,14 +1082,14 @@ void WaylandClipboard::Impl::onSendWritable(Send *send)
     finishSend(send);
 }
 
-void WaylandClipboard::Impl::finishSend(Send *send)
+void ClipboardWorker::finishSend(Send *send)
 {
     if (!send)
         return;
     sends.remove(send);
     if (send->notifier) {
         send->notifier->setEnabled(false);
-        QObject::disconnect(send->notifier, nullptr, q, nullptr);
+        QObject::disconnect(send->notifier, nullptr, this, nullptr);
         send->notifier->deleteLater();
     }
     if (send->fd >= 0)
@@ -1025,7 +1097,7 @@ void WaylandClipboard::Impl::finishSend(Send *send)
     delete send;
 }
 
-void WaylandClipboard::Impl::cancelSends()
+void ClipboardWorker::cancelSends()
 {
     const QList<Send *> live(sends.begin(), sends.end());
     for (Send *send : live)
@@ -1033,13 +1105,13 @@ void WaylandClipboard::Impl::cancelSends()
     sends.clear();
 }
 
-void WaylandClipboard::Impl::handleSourceCancelled(Source *source)
+void ClipboardWorker::handleSourceCancelled(Source *source)
 {
     // Another client (or we ourselves) replaced the selection.
     destroySource(source);
 }
 
-void WaylandClipboard::Impl::destroySource(Source *source)
+void ClipboardWorker::destroySource(Source *source)
 {
     if (!source)
         return;
@@ -1057,6 +1129,115 @@ void WaylandClipboard::Impl::destroySource(Source *source)
 }
 
 // ============================================================================
+// ClipboardWorker: thread entry points
+// ============================================================================
+
+ClipboardWorker::ClipboardWorker(WaylandClipboard::Impl *facade)
+    : state(facade)
+{
+    // Serving a paste is best effort: if the requesting client disappears
+    // mid-transfer, write() raises SIGPIPE and would kill the whole process.
+    // wl-clipboard does the same.
+    std::signal(SIGPIPE, SIG_IGN);
+}
+
+ClipboardWorker::~ClipboardWorker()
+{
+    teardown();
+}
+
+bool ClipboardWorker::start()
+{
+    return connectDisplay();
+}
+
+void ClipboardWorker::setText(const QString &text)
+{
+    installSource(text.toUtf8(),
+                  { QByteArrayLiteral("text/plain;charset=utf-8"),
+                    QByteArrayLiteral("text/plain"),
+                    QByteArrayLiteral("UTF8_STRING"),
+                    QByteArrayLiteral("TEXT"),
+                    QByteArrayLiteral("STRING") });
+}
+
+void ClipboardWorker::setImage(const QByteArray &data, const QString &mime)
+{
+    const QByteArray type = mime.isEmpty() ? QByteArrayLiteral("image/png")
+                                           : mime.toLatin1();
+    installSource(data, { type });
+}
+
+void ClipboardWorker::shutdown()
+{
+    teardown();
+}
+
+void ClipboardWorker::publishState()
+{
+    if (!state)
+        return;
+    state->publish(display != nullptr && manager != nullptr && device != nullptr,
+                   backend);
+}
+
+// ============================================================================
+// WaylandClipboard::Impl
+// ============================================================================
+
+WaylandClipboard::Impl::Impl(WaylandClipboard *owner)
+    : q(owner)
+    , worker(new ClipboardWorker(this))
+{
+    thread.setObjectName(QStringLiteral("WaylandClipboard"));
+    worker->moveToThread(&thread);
+
+    // Same-thread receiver (the facade) makes these queued automatically, so
+    // consumers see the signals on the thread that owns the QML engine.
+    QObject::connect(worker, &ClipboardWorker::textReceived,
+                     q, &WaylandClipboard::textReceived);
+    QObject::connect(worker, &ClipboardWorker::imageReceived,
+                     q, &WaylandClipboard::imageReceived);
+    QObject::connect(worker, &ClipboardWorker::selectionUnset,
+                     q, &WaylandClipboard::selectionUnset);
+    QObject::connect(worker, &ClipboardWorker::started,
+                     q, &WaylandClipboard::started);
+    QObject::connect(worker, &ClipboardWorker::failed,
+                     q, &WaylandClipboard::failed);
+
+    thread.start();
+}
+
+WaylandClipboard::Impl::~Impl()
+{
+    if (thread.isRunning()) {
+        // Tear the Wayland objects down on their own thread, then stop the
+        // loop.  Nothing here blocks on the compositor: teardown() only sends
+        // requests, it never waits for an answer.
+        QMetaObject::invokeMethod(worker, &ClipboardWorker::shutdown,
+                                  Qt::BlockingQueuedConnection);
+        thread.quit();
+        thread.wait();
+    }
+    // The worker thread is gone, so nobody else can touch the worker any more.
+    delete worker;
+    worker = nullptr;
+}
+
+void WaylandClipboard::Impl::publish(bool isAvailable, const QString &backendName)
+{
+    available.store(isAvailable, std::memory_order_relaxed);
+    QMutexLocker locker(&backendMutex);
+    backend = backendName;
+}
+
+QString WaylandClipboard::Impl::backendName() const
+{
+    QMutexLocker locker(&backendMutex);
+    return backend;
+}
+
+// ============================================================================
 // WaylandClipboard
 // ============================================================================
 
@@ -1064,11 +1245,6 @@ WaylandClipboard::WaylandClipboard(QObject *parent)
     : QObject(parent)
     , d(std::make_unique<Impl>(this))
 {
-    // Serving a paste is best effort: if the requesting client disappears
-    // mid-transfer, write() raises SIGPIPE and would kill the whole shell.
-    // wl-clipboard does the same.
-    std::signal(SIGPIPE, SIG_IGN);
-
     connect(this, &WaylandClipboard::failed, this, [](const QString &reason) {
         qWarning() << "[WaylandClipboard]" << reason;
     });
@@ -1078,39 +1254,50 @@ WaylandClipboard::~WaylandClipboard() = default;
 
 bool WaylandClipboard::start()
 {
-    return d->connectDisplay();
+    if (!d->thread.isRunning())
+        return false;
+
+    // Synchronous on purpose: the caller keeps the old contract of learning
+    // right away whether a backend could be bound.  The worker has an event
+    // loop and is never inside a blocking pipe transfer, so this cannot
+    // deadlock.
+    bool ok = false;
+    ClipboardWorker *worker = d->worker;
+    QMetaObject::invokeMethod(worker, [worker, &ok] { ok = worker->start(); },
+                              Qt::BlockingQueuedConnection);
+    return ok;
 }
 
 bool WaylandClipboard::asyncSend() const
 {
-    // Serving the selection never runs a blocking write any more, so a
-    // multi-megabyte payload (screenshot) cannot stall the event loop.
+    // Serving the selection never runs a blocking write, and it happens on
+    // the worker thread anyway, so a multi-megabyte payload (screenshot)
+    // cannot stall the GUI thread.
     return true;
 }
 
 bool WaylandClipboard::isAvailable() const
 {
-    return d->display != nullptr && d->manager != nullptr && d->device != nullptr;
+    return d->available.load(std::memory_order_relaxed);
 }
 
 QString WaylandClipboard::backendName() const
 {
-    return d->backend;
+    return d->backendName();
 }
 
 void WaylandClipboard::setText(const QString &text)
 {
-    d->installSource(text.toUtf8(),
-                     { QByteArrayLiteral("text/plain;charset=utf-8"),
-                       QByteArrayLiteral("text/plain"),
-                       QByteArrayLiteral("UTF8_STRING"),
-                       QByteArrayLiteral("TEXT"),
-                       QByteArrayLiteral("STRING") });
+    ClipboardWorker *worker = d->worker;
+    QMetaObject::invokeMethod(worker, [worker, text] { worker->setText(text); },
+                              Qt::QueuedConnection);
 }
 
 void WaylandClipboard::setImage(const QByteArray &data, const QString &mime)
 {
-    const QByteArray type = mime.isEmpty() ? QByteArrayLiteral("image/png")
-                                           : mime.toLatin1();
-    d->installSource(data, { type });
+    ClipboardWorker *worker = d->worker;
+    QMetaObject::invokeMethod(worker, [worker, data, mime] { worker->setImage(data, mime); },
+                              Qt::QueuedConnection);
 }
+
+#include "waylandclipboard.moc"

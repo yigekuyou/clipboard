@@ -61,12 +61,38 @@
 
 ### 连接与协议选择
 
-* `wl_display_connect(nullptr)` 建立独立连接，`QSocketNotifier` 接入 Qt 事件循环；
-  `prepare_read` / `poll` / `read_events` / `dispatch_pending` 是标准的
-  libwayland-Qt 集成方式，不会阻塞主线程。
+* `wl_display_connect(nullptr)` 建立独立连接，连接和它的全部对象都属于一个
+  独立的工作线程；`prepare_read` / `poll` / `read_events` / `dispatch_pending`
+  仍是标准的 libwayland-Qt 集成方式，只是跑在这个线程上。
+* 对外的 `setText()` / `setImage()` 只是把请求投递到工作线程（异步），
+  `start()` 会等这次连接完成（几次 roundtrip，毫秒级）后返回是否成功；
+  `textReceived` / `imageReceived` / `failed` / `started` 都会回到对象所属线程。
 * 第一次 `roundtrip` 只收集 global 名字，随后优先绑定 `ext-data-control-v1`，
   否则退回 `zwlr-data-control-unstable-v1`；再绑定第一个 `wl_seat` 并创建
   data device。协议不支持或连接断开时每 5 秒（无协议时 30 秒）重试。
+
+### 为什么连接要跑在独立线程
+
+QtWaylandClient（也就是 `QClipboard`）读剪贴板时会**阻塞调用线程**，等管道里的
+数据：`QWaylandMimeData::readData()` 用 1 秒超时的 `poll()` 死等，等不到就打印
+
+```
+QWaylandDataOffer: timeout reading from pipe
+QWaylandDataOffer: error reading data for mimeType text/plain;charset=utf-8
+```
+
+问题在于：读取方拿到的数据要由 selection 的持有者提供，而这里的主人正是宿主进程
+自己。Quickshell 在剪贴板面板里点击条目（或任何 Qt 控件里 Ctrl+V）时，主线程正卡在
+上面那个 `poll()` 里，不可能再去 dispatch 我们这条连接上的 `send` 请求——两端在同一个
+事件循环里互等 1 秒，读到的永远是空数据。旧版把“写管道”改成非阻塞只解决了大图卡死，
+没有解决这个互等，因为请求本身都没被 dispatch。
+
+所以整个连接（registry / device / offer / source / 所有 fd 的 `QSocketNotifier`）
+都放在一个工作线程上：
+
+* 主线程阻塞在 `poll()` 时，工作线程照常 dispatch，`send` 立刻拿到数据并关闭写端；
+* 读取方（无论同进程还是别的进程）都能在毫秒级读到完整内容；
+* 大图仍走非阻塞写 + `QSocketNotifier`，慢读取方不会卡住工作线程的分发。
 
 ### 读取 selection
 
@@ -85,6 +111,7 @@
 
 * 每次复制创建一个新的 `ext/wlr_data_control_source_v1`，先 `offer()` 所有 MIME
   类型，再 `set_selection()`；收到 `send(mime, fd)` 时把数据写入 fd 并关闭。
+  这两步都在工作线程上，所以即使 GUI 线程正卡在别人的管道读取里也照常应答。
   旧 source 在收到 `cancelled` 后销毁。
 * 进程忽略 `SIGPIPE`：请求方中途消失时 `write()` 不应杀死整个 shell。
 
@@ -187,6 +214,10 @@ Singleton {
 * `Image { source: "image://clipboard/<uid>" }` 加载成功（`status=Ready`，尺寸正确）；
 * `copyToClipboard()` 后 `wl-paste` 读到同样的文本；`copyImage("image://clipboard/1")`
   后 `wl-paste --type image/png` 读到 73 字节；
+* **同一进程**内用 `QClipboard` 读回自己发布的 selection（Quickshell 里
+  `TextEdit.paste()` / `Quickshell.clipboardText` 就是这条路径）：3 MiB 的
+  `image/png` 与文本都在 0–2 ms 内读全、内容一致，不再出现
+  `QWaylandDataOffer: timeout reading from pipe`；
 * 重复复制同一张图不会新增条目，只提升到顶部；
 * `removeEntry()` / `clearHistory()` 正常，内存条目被释放；
 * 整个运行过程不产生任何磁盘文件。
