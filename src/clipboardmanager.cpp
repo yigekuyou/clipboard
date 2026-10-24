@@ -15,6 +15,10 @@
 
 namespace {
 
+// Matches kMaxTransferBytes on the Wayland side: anything larger is a mistake
+// (a mistakenly picked file rather than an image), not a clipboard payload.
+constexpr qint64 kMaxEntryBytes = 64 * 1024 * 1024;
+
 QString localPath(const QString &path)
 {
     if (!path.startsWith(QLatin1String("file:")))
@@ -52,17 +56,26 @@ public:
         QImage image;
         if (ok) {
             if (const ClipboardHistoryModel::Entry *entry = m_model->findByUid(uid)) {
-                if (!entry->imageData.isEmpty())
-                    image.loadFromData(entry->imageData,
-                                       entry->mime.toLatin1().constData());
+                if (!entry->imageData.isEmpty()) {
+                    QBuffer buffer;
+                    buffer.setData(entry->imageData);
+                    buffer.open(QIODevice::ReadOnly);
+                    QImageReader reader(&buffer, entry->mime.toLatin1().constData());
+                    // Decode straight at the requested size: a 4K screenshot is
+                    // ~30 MB once decoded, and the popup only shows thumbnails.
+                    if (!requestedSize.isEmpty()) {
+                        const QSize source = reader.size();
+                        if (source.isValid())
+                            reader.setScaledSize(source.scaled(requestedSize,
+                                                               Qt::KeepAspectRatio));
+                    }
+                    image = reader.read();
+                }
             }
         }
 
         if (size)
             *size = image.size();
-        if (!image.isNull() && !requestedSize.isEmpty())
-            image = image.scaled(requestedSize, Qt::KeepAspectRatio,
-                                 Qt::SmoothTransformation);
         return image;
     }
 
@@ -164,6 +177,15 @@ void ClipboardHistoryModel::removeAt(int row)
     beginRemoveRows(QModelIndex(), row, row);
     m_entries.removeAt(row);
     endRemoveRows();
+}
+
+void ClipboardHistoryModel::touchTime(int row, qint64 time)
+{
+    if (row < 0 || row >= m_entries.size())
+        return;
+    m_entries[row].time = time;
+    const QModelIndex idx = index(row, 0);
+    emit dataChanged(idx, idx, {TimeRole});
 }
 
 void ClipboardHistoryModel::clear()
@@ -270,8 +292,12 @@ void ClipboardManager::addText(const QString &raw)
 
     const int existing = findDuplicate(QStringLiteral("text"), text, {});
     if (existing == 0) {
-        // Copying from our own history must not create a second entry.
+        // Copying from our own history must not create a second entry, but the
+        // timestamp should follow the newest copy so the panel does not claim
+        // the entry is hours old.
+        m_history->touchTime(0, QDateTime::currentMSecsSinceEpoch());
         setCurrent(QStringLiteral("text"), text);
+        emit historyUpdated();
         return;
     }
 
@@ -305,8 +331,10 @@ void ClipboardManager::addImageData(const QByteArray &data, const QString &mime)
 
     const int existing = findDuplicate(QStringLiteral("image"), {}, hash);
     if (existing == 0) {
-        // Same image copied again: nothing to store.
+        // Same image copied again: nothing to store, only the timestamp moves.
+        m_history->touchTime(0, QDateTime::currentMSecsSinceEpoch());
         setCurrent(QStringLiteral("image"), QString());
+        emit historyUpdated();
         return;
     }
 
@@ -406,7 +434,9 @@ bool ClipboardManager::asyncSend() const
 
 void ClipboardManager::copyToClipboard(const QString &text)
 {
-    if (text.isEmpty())
+    // 与 addText 同一套规则：只有空白的内容既不进历史，也不该抢走当前选区
+    // （否则工具栏状态会显示一条历史里并不存在的条目）。
+    if (text.isEmpty() || text.trimmed().isEmpty())
         return;
     m_wayland->setText(text);
     // The compositor echoes the new selection back through the data-control
@@ -441,6 +471,16 @@ void ClipboardManager::copyImage(const QString &path, const QString &mime)
         if (type.isEmpty())
             type = QStringLiteral("image/png");
     }
+
+    if (data.isEmpty())
+        return;
+    if (data.size() > kMaxEntryBytes) {
+        qWarning() << "[ClipboardManager] image too large to publish:"
+                   << data.size() << "bytes";
+        return;
+    }
+    if (!type.startsWith(QLatin1String("image/")))
+        type = QStringLiteral("image/png");
 
     m_wayland->setImage(data, type);
     setCurrent(QStringLiteral("image"), QString());

@@ -71,6 +71,8 @@ public:
     void append(const Entry &entry);
     void insertAt(int row, const Entry &entry);
     void removeAt(int row);
+    /// Refresh the timestamp of an existing row (same content copied again).
+    void touchTime(int row, qint64 time);
     void clear();
 
 private:

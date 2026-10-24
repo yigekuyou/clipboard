@@ -581,6 +581,10 @@ void ClipboardWorker::handleGlobalRemove(uint32_t name)
         wl_seat_destroy(seat);
         seat = nullptr;
     }
+
+    // The data device is gone with the seat: keep isAvailable() honest so the
+    // QML side can tell the difference between "no selection" and "no backend".
+    publishState();
 }
 
 void ClipboardWorker::ensureObjects()
